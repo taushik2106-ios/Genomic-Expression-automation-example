@@ -1,0 +1,427 @@
+"""
+TCGA-BRCA Molecular Subtype Classifier
+=======================================
+Author:  Taushik (Genomic Expression Intern)
+Date:    May 2026
+
+Description:
+    Automates classification of breast cancer patients from the TCGA-BRCA
+    clinical JSON file into three molecular subtypes:
+        - HR+   : Hormone Receptor Positive (ESR1+ or PGR+, ERBB2-)
+        - HER2+ : HER2 Positive (ERBB2+)
+        - TNBC  : Triple Negative (ESR1-, PGR-, ERBB2-)
+
+    Produces:
+        1. per_patient_subtypes.csv   — one row per patient with all metadata
+        2. subtype_summary.csv        — count & % per subtype
+        3. stage_subtype_summary.csv  — subtype counts broken down by stage
+        4. age_subtype_summary.csv    — subtype counts broken down by age group
+        5. TCGA_BRCA_Subtype_Report.xlsx — formatted Excel report
+
+Usage:
+    python tcga_brca_classifier.py --input clinical_project-tcga-brca.json
+    python tcga_brca_classifier.py --input clinical_project-tcga-brca.json --output results/
+"""
+
+import json
+import argparse
+import os
+import pandas as pd
+from collections import Counter
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_marker_status(molecular_tests: list, gene: str) -> str:
+    """Extract test result for a given gene symbol from molecular_tests list."""
+    for test in molecular_tests:
+        if str(test.get("gene_symbol", "")).upper() == gene.upper():
+            return str(test.get("test_value", "Not Reported")).strip()
+    return "Not Reported"
+
+
+def classify_subtype(esr1: str, pgr: str, erbb2: str) -> str:
+    """
+    Classify molecular subtype based on receptor status.
+
+    Priority order:
+        1. HER2+  → ERBB2 Positive (regardless of ER/PR)
+        2. HR+    → ESR1 or PGR Positive, ERBB2 Negative
+        3. TNBC   → All three Negative
+        4. Unclassified → Any marker is Not Reported
+    """
+    def is_positive(val):
+        return str(val).strip().lower() == "positive"
+
+    def is_negative(val):
+        return str(val).strip().lower() == "negative"
+
+    if is_positive(erbb2):
+        return "HER2+"
+    elif is_positive(esr1) or is_positive(pgr):
+        return "HR+"
+    elif is_negative(esr1) and is_negative(pgr) and is_negative(erbb2):
+        return "TNBC"
+    else:
+        return "Unclassified"
+
+
+def clean_stage(raw_stage: str) -> str:
+    """Collapse detailed stage labels into 4 main stages."""
+    s = str(raw_stage)
+    if "IV" in s:  return "Stage IV"
+    elif "III" in s: return "Stage III"
+    elif "II" in s:  return "Stage II"
+    elif "I" in s:   return "Stage I"
+    return "Not Reported"
+
+
+def get_age_group(age) -> str:
+    """Bin age into decade groups."""
+    try:
+        age = int(age)
+        if age < 30:  return "20-29"
+        elif age < 40: return "30-39"
+        elif age < 50: return "40-49"
+        elif age < 60: return "50-59"
+        elif age < 70: return "60-69"
+        elif age < 80: return "70-79"
+        else:          return "80+"
+    except (ValueError, TypeError):
+        return "Unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE PROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_clinical_json(filepath: str) -> pd.DataFrame:
+    """
+    Load TCGA clinical JSON and extract per-patient metadata + subtype.
+    Returns a DataFrame with one row per female patient.
+    """
+    print(f"Loading: {filepath}")
+    with open(filepath, "r") as f:
+        data = json.load(f)
+
+    print(f"  Total records in file: {len(data)}")
+    rows = []
+
+    for record in data:
+        # ── Demographics ──────────────────────────────────────────────────────
+        gender = str(record.get("gender", "")).lower()
+        if gender != "female":
+            continue  # female patients only
+
+        patient_id   = record.get("submitter_id", record.get("case_submitter_id", "Unknown"))
+        age          = record.get("age_at_index", None)
+        race         = record.get("race", "Not Reported")
+        vital_status = record.get("vital_status", "Not Reported")
+
+        # ── Diagnoses (stage + histology) ────────────────────────────────────
+        diagnoses    = record.get("diagnoses", [{}])
+        diag         = diagnoses[0] if diagnoses else {}
+        raw_stage    = diag.get("ajcc_pathologic_stage", "Not Reported")
+        histology    = diag.get("primary_diagnosis", "Not Reported")
+
+        # ── Molecular tests (receptor status) ────────────────────────────────
+        mol_tests    = record.get("molecular_tests", [])
+        esr1         = get_marker_status(mol_tests, "ESR1")
+        pgr          = get_marker_status(mol_tests, "PGR")
+        erbb2        = get_marker_status(mol_tests, "ERBB2")
+
+        # ── Classification ───────────────────────────────────────────────────
+        subtype      = classify_subtype(esr1, pgr, erbb2)
+        stage        = clean_stage(raw_stage)
+        age_grp      = get_age_group(age)
+
+        rows.append({
+            "patient_id":        patient_id,
+            "age_at_diagnosis":  age,
+            "age_group":         age_grp,
+            "race":              race,
+            "vital_status":      vital_status,
+            "raw_stage":         raw_stage,
+            "stage":             stage,
+            "histology":         histology,
+            "ESR1":              esr1,
+            "PGR":               pgr,
+            "ERBB2":             erbb2,
+            "molecular_subtype": subtype,
+        })
+
+    df = pd.DataFrame(rows)
+    print(f"  Female patients processed: {len(df)}")
+    print(f"  Subtype counts:\n{df['molecular_subtype'].value_counts().to_string()}")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUMMARY TABLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_subtype_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Count and percentage per subtype."""
+    total = len(df)
+    counts = df["molecular_subtype"].value_counts().reset_index()
+    counts.columns = ["Subtype", "Count"]
+    counts["% of Cohort"] = (counts["Count"] / total * 100).round(1).astype(str) + "%"
+    total_row = pd.DataFrame([{"Subtype": "TOTAL", "Count": total, "% of Cohort": "100.0%"}])
+    return pd.concat([counts, total_row], ignore_index=True)
+
+
+def make_stage_subtype_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Cross-tabulation of Stage × Subtype."""
+    subtypes = ["HR+", "HER2+", "TNBC", "Unclassified"]
+    stages   = ["Stage I", "Stage II", "Stage III", "Stage IV", "Not Reported"]
+
+    pivot = pd.crosstab(df["stage"], df["molecular_subtype"])
+    # Ensure all expected columns exist
+    for s in subtypes:
+        if s not in pivot.columns:
+            pivot[s] = 0
+    pivot = pivot.reindex(columns=subtypes, fill_value=0)
+    pivot["TOTAL"] = pivot.sum(axis=1)
+    pivot = pivot.reindex(stages).fillna(0).astype(int)
+    pivot.loc["TOTAL"] = pivot.sum()
+    pivot.index.name = "Stage"
+    return pivot.reset_index()
+
+
+def make_age_subtype_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Cross-tabulation of Age Group × Subtype."""
+    subtypes  = ["HR+", "HER2+", "TNBC", "Unclassified"]
+    age_order = ["20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+", "Unknown"]
+
+    pivot = pd.crosstab(df["age_group"], df["molecular_subtype"])
+    for s in subtypes:
+        if s not in pivot.columns:
+            pivot[s] = 0
+    pivot = pivot.reindex(columns=subtypes, fill_value=0)
+    pivot["TOTAL"] = pivot.sum(axis=1)
+    pivot = pivot.reindex(age_order).fillna(0).astype(int)
+    pivot.loc["TOTAL"] = pivot.sum()
+    pivot.index.name = "Age Group"
+    return pivot.reset_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXCEL REPORT BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bdr():
+    s = Side(style="thin", color="BFBFBF")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _sc(ws, row, col, val, font=None, fill=None, align=None, fmt=None):
+    cell = ws.cell(row=row, column=col, value=val)
+    cell.font      = font  or Font(name="Arial", size=10)
+    cell.fill      = fill  or PatternFill()
+    cell.alignment = align or Alignment(horizontal="center", vertical="center")
+    cell.border    = _bdr()
+    if fmt:
+        cell.number_format = fmt
+    return cell
+
+def write_excel_report(df: pd.DataFrame,
+                       subtype_summary: pd.DataFrame,
+                       stage_summary: pd.DataFrame,
+                       age_summary: pd.DataFrame,
+                       out_path: str):
+    """Write all results to a formatted Excel workbook."""
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    h1_f   = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
+    h2_f   = PatternFill("solid", start_color="2E75B6", end_color="2E75B6")
+    tnbc_f = PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6")
+    her2_f = PatternFill("solid", start_color="DEEAF1", end_color="DEEAF1")
+    hr_f   = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")
+    unc_f  = PatternFill("solid", start_color="F4F4F4", end_color="F4F4F4")
+    tot_f  = PatternFill("solid", start_color="FFF2CC", end_color="FFF2CC")
+    alt1_f = PatternFill("solid", start_color="F2F9EE", end_color="F2F9EE")
+    alt2_f = PatternFill("solid", start_color="EBF3FB", end_color="EBF3FB")
+
+    SUBTYPE_FILL = {"HR+": hr_f, "HER2+": her2_f, "TNBC": tnbc_f,
+                    "Unclassified": unc_f, "TOTAL": tot_f}
+
+    wb_bold = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    db_bold = Font(name="Arial", bold=True, color="1F4E79", size=11)
+    norm    = Font(name="Arial", size=10)
+    sm_it   = Font(name="Arial", size=9, italic=True, color="595959")
+    ctr     = Alignment(horizontal="center", vertical="center")
+    lft     = Alignment(horizontal="left",   vertical="center")
+    wrap_l  = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    wb = Workbook()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 1 — Per-Patient Results
+    # ══════════════════════════════════════════════════════════════════════════
+    ws1 = wb.active
+    ws1.title = "Per-Patient Results"
+
+    ws1.merge_cells("A1:L1")
+    ws1["A1"].value = "TCGA-BRCA — Per-Patient Molecular Subtype Classification"
+    ws1["A1"].font  = Font(name="Arial", bold=True, color="FFFFFF", size=13)
+    ws1["A1"].fill  = h1_f
+    ws1["A1"].alignment = ctr
+    ws1.row_dimensions[1].height = 26
+
+    col_names = list(df.columns)
+    for ci, h in enumerate(col_names, 1):
+        _sc(ws1, 2, ci, h.replace("_", " ").title(), font=wb_bold, fill=h2_f)
+
+    for ri, row_data in enumerate(df.itertuples(index=False), 3):
+        subtype = row_data.molecular_subtype
+        fill    = SUBTYPE_FILL.get(subtype, unc_f)
+        alt     = alt1_f if ri % 2 == 0 else alt2_f
+        for ci, val in enumerate(row_data, 1):
+            f = fill if ci == len(col_names) else alt
+            _sc(ws1, ri, ci, val, fill=f, align=lft if ci <= 2 else ctr)
+
+    widths1 = [20, 8, 10, 22, 14, 14, 28, 14, 12, 12, 12, 16]
+    for i, w in enumerate(widths1, 1):
+        ws1.column_dimensions[get_column_letter(i)].width = w
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 2 — Subtype Summary
+    # ══════════════════════════════════════════════════════════════════════════
+    ws2 = wb.create_sheet("Subtype Summary")
+
+    ws2.merge_cells("A1:C1")
+    ws2["A1"].value = "Molecular Subtype Distribution — TCGA-BRCA (Female)"
+    ws2["A1"].font  = Font(name="Arial", bold=True, color="FFFFFF", size=12)
+    ws2["A1"].fill  = h1_f; ws2["A1"].alignment = ctr
+    ws2.row_dimensions[1].height = 24
+
+    for ci, h in enumerate(["Subtype", "Count", "% of Cohort"], 1):
+        _sc(ws2, 3, ci, h, font=wb_bold, fill=h2_f)
+
+    for ri, row_data in enumerate(subtype_summary.itertuples(index=False), 4):
+        fill = SUBTYPE_FILL.get(row_data.Subtype, unc_f)
+        _sc(ws2, ri, 1, row_data.Subtype, fill=fill, align=lft,
+            font=db_bold if row_data.Subtype == "TOTAL" else norm)
+        _sc(ws2, ri, 2, row_data.Count,
+            fill=fill, font=db_bold if row_data.Subtype == "TOTAL" else norm)
+        _sc(ws2, ri, 3, str(row_data[2]),
+            fill=fill, font=db_bold if row_data.Subtype == "TOTAL" else norm)
+
+    for i, w in enumerate([20, 12, 14], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 3 — Stage × Subtype
+    # ══════════════════════════════════════════════════════════════════════════
+    ws3 = wb.create_sheet("Stage × Subtype")
+
+    ws3.merge_cells(f"A1:{get_column_letter(len(stage_summary.columns))}1")
+    ws3["A1"].value = "Stage × Molecular Subtype — TCGA-BRCA (Female)"
+    ws3["A1"].font  = Font(name="Arial", bold=True, color="FFFFFF", size=12)
+    ws3["A1"].fill  = h1_f; ws3["A1"].alignment = ctr
+    ws3.row_dimensions[1].height = 24
+
+    for ci, h in enumerate(stage_summary.columns, 1):
+        _sc(ws3, 3, ci, h, font=wb_bold, fill=h2_f)
+
+    alt_fills = [alt1_f, alt2_f]
+    for ri, row_data in enumerate(stage_summary.itertuples(index=False), 4):
+        is_total = str(row_data[0]) == "TOTAL"
+        row_fill = tot_f if is_total else alt_fills[ri % 2]
+        fnt      = db_bold if is_total else norm
+        for ci, val in enumerate(row_data, 1):
+            col_name = stage_summary.columns[ci - 1]
+            f = SUBTYPE_FILL.get(col_name, row_fill) if not is_total else tot_f
+            _sc(ws3, ri, ci, val, fill=f, align=lft if ci == 1 else ctr, font=fnt)
+
+    for i, w in enumerate([14, 12, 12, 14, 14, 12], 1):
+        ws3.column_dimensions[get_column_letter(i)].width = w
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 4 — Age × Subtype
+    # ══════════════════════════════════════════════════════════════════════════
+    ws4 = wb.create_sheet("Age × Subtype")
+
+    ws4.merge_cells(f"A1:{get_column_letter(len(age_summary.columns))}1")
+    ws4["A1"].value = "Age Group × Molecular Subtype — TCGA-BRCA (Female)"
+    ws4["A1"].font  = Font(name="Arial", bold=True, color="FFFFFF", size=12)
+    ws4["A1"].fill  = h1_f; ws4["A1"].alignment = ctr
+    ws4.row_dimensions[1].height = 24
+
+    for ci, h in enumerate(age_summary.columns, 1):
+        _sc(ws4, 3, ci, h, font=wb_bold, fill=h2_f)
+
+    for ri, row_data in enumerate(age_summary.itertuples(index=False), 4):
+        is_total = str(row_data[0]) == "TOTAL"
+        row_fill = tot_f if is_total else alt_fills[ri % 2]
+        fnt      = db_bold if is_total else norm
+        for ci, val in enumerate(row_data, 1):
+            col_name = age_summary.columns[ci - 1]
+            f = SUBTYPE_FILL.get(col_name, row_fill) if not is_total else tot_f
+            _sc(ws4, ri, ci, val, fill=f, align=lft if ci == 1 else ctr, font=fnt)
+
+    for i, w in enumerate([14, 12, 12, 14, 14, 12], 1):
+        ws4.column_dimensions[get_column_letter(i)].width = w
+
+    wb.save(out_path)
+    print(f"  Excel report saved: {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="TCGA-BRCA Molecular Subtype Classifier"
+    )
+    parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Path to TCGA clinical JSON file"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="output/",
+        help="Output directory (default: output/)"
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    # ── Process ───────────────────────────────────────────────────────────────
+    print("\n=== TCGA-BRCA Molecular Subtype Classifier ===\n")
+    df = process_clinical_json(args.input)
+
+    # ── Build summaries ───────────────────────────────────────────────────────
+    subtype_summary = make_subtype_summary(df)
+    stage_summary   = make_stage_subtype_summary(df)
+    age_summary     = make_age_subtype_summary(df)
+
+    # ── Save CSVs ─────────────────────────────────────────────────────────────
+    df.to_csv(os.path.join(args.output, "per_patient_subtypes.csv"), index=False)
+    subtype_summary.to_csv(os.path.join(args.output, "subtype_summary.csv"), index=False)
+    stage_summary.to_csv(os.path.join(args.output, "stage_subtype_summary.csv"), index=False)
+    age_summary.to_csv(os.path.join(args.output, "age_subtype_summary.csv"), index=False)
+    print(f"\nCSV files saved to: {args.output}")
+
+    # ── Save Excel ────────────────────────────────────────────────────────────
+    excel_path = os.path.join(args.output, "TCGA_BRCA_Subtype_Report.xlsx")
+    write_excel_report(df, subtype_summary, stage_summary, age_summary, excel_path)
+
+    print("\n=== Done! ===")
+    print(f"Output folder: {args.output}")
+    print("Files generated:")
+    print("  per_patient_subtypes.csv")
+    print("  subtype_summary.csv")
+    print("  stage_subtype_summary.csv")
+    print("  age_subtype_summary.csv")
+    print("  TCGA_BRCA_Subtype_Report.xlsx")
+
+
+if __name__ == "__main__":
+    main()
